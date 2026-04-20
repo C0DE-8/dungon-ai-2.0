@@ -8,8 +8,8 @@ const {
   getTimeOfDay
 } = require("../services/timeEngine");
 const {
-  createEnemyIfNew,
   markEnemyDiscovered,
+  resolveEnemyEncounter,
   setCurrentEnemy,
   getCurrentEnemy,
   shouldEncounterEnemy
@@ -49,7 +49,9 @@ function normalizeAction(input = "") {
 
 async function clearCurrentEnemy(conn, playerId) {
   await conn.query(
-    `DELETE FROM player_current_enemy WHERE player_id = ?`,
+    `UPDATE player_current_enemy
+     SET enemy_current_hp = 0, encounter_state = 'defeated'
+     WHERE player_id = ?`,
     [playerId]
   );
 }
@@ -421,7 +423,9 @@ router.post("/", authenticateToken, async (req, res) => {
       }
 
       if (dungeonProgression.trigger_boss) {
-        encounteredBoss = await startBossEncounter(conn, player.id, player.current_floor);
+        encounteredBoss = await startBossEncounter(conn, player.id, player.current_floor, {
+          triggerKey: dungeonProgression.boss_trigger_key
+        });
         encounteredEnemy = null;
         sceneType = "boss_encounter";
         sceneTitle = "The Floor Guardian Appears";
@@ -432,15 +436,18 @@ router.post("/", authenticateToken, async (req, res) => {
       const roll = Math.random();
 
       if (roll < 0.45) {
-        const generated = await createEnemyIfNew(conn, {
+        const generated = await resolveEnemyEncounter(conn, {
+          playerId: player.id,
           floor: player.current_floor,
-          area: nextArea
+          area: nextArea,
+          progressionTrigger: dungeonProgression.event_key,
+          encounterState: "active"
         });
 
         encounteredEnemy = generated.enemy;
         enemyWasNew = generated.isNew;
 
-        await markEnemyDiscovered(conn, player.id, encounteredEnemy.id);
+        await markEnemyDiscovered(conn, player.id, encounteredEnemy.enemy_id || encounteredEnemy.id);
         await setCurrentEnemy(conn, player.id, encounteredEnemy);
 
         sceneType = "encounter";

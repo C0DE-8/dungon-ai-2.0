@@ -117,7 +117,8 @@ async function resolveDungeonProgression(conn, { player, actionKey, hasActiveEne
     return {
       event_key: "boss_trigger_revealed",
       message: "A hidden seal answers the player's exploration. A floor guardian is drawn into the area.",
-      trigger_boss: true
+      trigger_boss: true,
+      boss_trigger_key: `floor_${floor}_hidden_seal`
     };
   }
 
