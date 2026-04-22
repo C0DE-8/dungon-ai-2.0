@@ -42,9 +42,41 @@ function extractJson(text = "") {
   }
 }
 
-function buildFallbackResponse(narration = DEFAULT_NARRATION) {
+function buildFallbackNarration(context = null) {
+  const feedback = context?.event_feedback;
+  if (!feedback) return DEFAULT_NARRATION;
+
+  const location = feedback.location?.after || context?.environment?.area || "the dungeon";
+  const intent = feedback.action?.resolved_intent || context?.action || "action";
+  const outcome = feedback.action?.resolution_type || "resolved";
+  const hpDelta = Number(feedback.consequences?.hp_delta || 0);
+  const safety = feedback.consequences?.safety_state;
+  const movement = feedback.consequences?.moved
+    ? ` The player moves to ${location}.`
+    : ` The player remains in ${location}.`;
+  const hpText = hpDelta === 0
+    ? " Condition is unchanged."
+    : hpDelta > 0
+      ? ` HP rises by ${hpDelta}.`
+      : ` HP falls by ${Math.abs(hpDelta)}.`;
+  const safetyText = safety ? ` Safety state: ${safety}.` : "";
+
+  return `${titleCase(intent)} resolves as ${outcome} in ${location}.${movement}${hpText}${safetyText}`;
+}
+
+function titleCase(value = "") {
+  return String(value)
+    .replace(/[_-]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function buildFallbackResponse(context = null, narration = null) {
   return {
-    narration,
+    narration: narration || buildFallbackNarration(context),
     choices: DEFAULT_CHOICES,
     source: "fallback"
   };
@@ -110,7 +142,7 @@ async function generateNarration({ context, persona = "ADMIN" }) {
     }
 
     if (!text) {
-      return buildFallbackResponse();
+      return buildFallbackResponse(context);
     }
 
     const parsed = extractJson(text);
@@ -135,7 +167,7 @@ async function generateNarration({ context, persona = "ADMIN" }) {
     };
   } catch (error) {
     console.error("generateNarration error:", error);
-    return buildFallbackResponse();
+    return buildFallbackResponse(context);
   }
 }
 

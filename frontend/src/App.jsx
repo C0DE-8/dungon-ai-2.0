@@ -3,6 +3,7 @@ import { Toaster } from "react-hot-toast";
 import Login from "./pages/auth/Login";
 import Register from "./pages/auth/Register";
 import Dashboard from "./pages/dashboard/Dashboard";
+import Profile from "./pages/profile/Profile";
 import NotFound from "./pages/not-found/NotFound";
 import ProtectedRoute from "./components/ProtectedRoute";
 import styles from "./App.module.css";
@@ -58,6 +59,15 @@ function App() {
             element={
               <ProtectedRoute>
                 <Dashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route
+            path="/profile"
+            element={
+              <ProtectedRoute>
+                <Profile />
               </ProtectedRoute>
             }
           />

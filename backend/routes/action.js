@@ -15,6 +15,16 @@ const {
   shouldEncounterEnemy
 } = require("../services/enemyEngine");
 const { resolveBattleTurn } = require("../services/battleEngine");
+const {
+  createRemains,
+  deriveSceneTags,
+  getActiveOpponent,
+  getActiveRemains,
+  interpretTextAction,
+  interpretTextActionPlan,
+  logTextActionInterpretation,
+  resolveTextAction
+} = require("../services/textActionEngine");
 const { applyExpGain } = require("../services/levelEngine");
 const {
   evaluateSkillProgression,
@@ -47,11 +57,53 @@ function normalizeAction(input = "") {
   return String(input).trim().toLowerCase();
 }
 
+function getFallbackAreaName(player, label) {
+  return `Floor ${Number(player.current_floor) || 1} ${label}`;
+}
+
+function getEscapeDestination(player, currentArea, resolutionType) {
+  if (resolutionType === "success") {
+    if (String(currentArea || "").toLowerCase().includes("sealed")) {
+      return getFallbackAreaName(player, "Quiet Seal Alcove");
+    }
+
+    if (String(currentArea || "").toLowerCase().includes("dust")) {
+      return getFallbackAreaName(player, "Dust-Choked Refuge");
+    }
+
+    return getFallbackAreaName(player, "Shadowed Refuge");
+  }
+
+  if (resolutionType === "partial_success") {
+    return getFallbackAreaName(player, "Temporary Cover");
+  }
+
+  return currentArea;
+}
+
 async function clearCurrentEnemy(conn, playerId) {
   await conn.query(
     `UPDATE player_current_enemy
      SET enemy_current_hp = 0, encounter_state = 'defeated'
      WHERE player_id = ?`,
+    [playerId]
+  );
+}
+
+async function markEnemyEscaped(conn, playerId) {
+  await conn.query(
+    `UPDATE player_current_enemy
+     SET encounter_state = 'escaped'
+     WHERE player_id = ? AND encounter_state = 'active'`,
+    [playerId]
+  );
+}
+
+async function markBossEscaped(conn, playerId) {
+  await conn.query(
+    `UPDATE player_current_boss
+     SET encounter_state = 'escaped'
+     WHERE player_id = ? AND encounter_state = 'active'`,
     [playerId]
   );
 }
@@ -171,6 +223,12 @@ router.post("/", authenticateToken, async (req, res) => {
     let defeatedBoss = null;
     let finalAscension = null;
     let dungeonProgression = { event_key: "none", message: null };
+    let textInterpretation = null;
+    let textResolution = null;
+    let sceneTags = [];
+    let suppressDungeonProgression = false;
+    let eventFeedback = null;
+    let textActionDefeatedPlayer = false;
     let skillProgression = {
       dynamic_skill_keys: [],
       unlocked: []
@@ -260,6 +318,13 @@ router.post("/", authenticateToken, async (req, res) => {
 
             await markBossDefeated(conn, player, encounteredBoss);
             const bossProgression = await markFloorBossDefeated(conn, player.id, encounteredBoss.floor_number);
+            await createRemains(conn, {
+              playerId: player.id,
+              enemyName: encounteredBoss.name,
+              enemyType: "boss",
+              sourceType: "boss",
+              sourceId: encounteredBoss.boss_id
+            });
             await clearCurrentBoss(conn, player.id);
 
             if (bossProgression.dungeon_completed) {
@@ -287,6 +352,13 @@ router.post("/", authenticateToken, async (req, res) => {
 
             await markBossDefeated(conn, player, encounteredBoss);
             await markFloorBossDefeated(conn, player.id, encounteredBoss.floor_number);
+            await createRemains(conn, {
+              playerId: player.id,
+              enemyName: encounteredBoss.name,
+              enemyType: "boss",
+              sourceType: "boss",
+              sourceId: encounteredBoss.boss_id
+            });
             await clearCurrentBoss(conn, player.id);
             await triggerDeathFlow(conn, player, `Killed while defeating boss: ${encounteredBoss.name}`);
 
@@ -370,6 +442,13 @@ router.post("/", authenticateToken, async (req, res) => {
               ? `The player attacks ${encounteredEnemy.name} and defeats it. The player gains ${expReward} EXP and levels up.`
               : `The player attacks ${encounteredEnemy.name} and defeats it. The player gains ${expReward} EXP.`;
 
+            await createRemains(conn, {
+              playerId: player.id,
+              enemyName: encounteredEnemy.name,
+              enemyType: encounteredEnemy.enemy_type,
+              sourceType: "enemy",
+              sourceId: encounteredEnemy.enemy_id || encounteredEnemy.id
+            });
             await clearCurrentEnemy(conn, player.id);
           } else if (battleResult.resultTag === "player_defeated") {
             systemOutcome = `${encounteredEnemy.name} overpowers the player.`;
@@ -380,6 +459,13 @@ router.post("/", authenticateToken, async (req, res) => {
           } else if (battleResult.resultTag === "double_ko") {
             systemOutcome = `Both the player and ${encounteredEnemy.name} fall in the same clash.`;
             defeatedEnemy = encounteredEnemy;
+            await createRemains(conn, {
+              playerId: player.id,
+              enemyName: encounteredEnemy.name,
+              enemyType: encounteredEnemy.enemy_type,
+              sourceType: "enemy",
+              sourceId: encounteredEnemy.enemy_id || encounteredEnemy.id
+            });
             await clearCurrentEnemy(conn, player.id);
             await triggerDeathFlow(conn, player, `Killed while defeating enemy: ${encounteredEnemy.name}`);
             nextHp = 0;
@@ -400,10 +486,524 @@ router.post("/", authenticateToken, async (req, res) => {
       actionKey = "typed";
       sceneTitle = "An Unscripted Move";
       sceneType = "typed_action";
-      systemOutcome = `Player attempts: "${actionInput}"`;
+
+      const activeRemains = await getActiveRemains(conn, player.id);
+      sceneTags = deriveSceneTags({
+        player,
+        currentScene,
+        activeOpponent: getActiveOpponent(encounteredEnemy, encounteredBoss),
+        remains: activeRemains
+      });
+
+      await conn.query(
+        `INSERT INTO player_scene_environment (player_id, area_name, tags_json)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           area_name = VALUES(area_name),
+           tags_json = VALUES(tags_json)`,
+        [player.id, player.current_area, JSON.stringify(sceneTags)]
+      );
+
+      const textPlan = interpretTextActionPlan(actionInput, {
+        player,
+        currentScene,
+        enemy: encounteredEnemy,
+        boss: encounteredBoss,
+        sceneTags
+      });
+
+      if (textPlan.is_sequence) {
+        textInterpretation = textPlan;
+        suppressDungeonProgression = true;
+
+        const stepResolutions = [];
+        const outcomeParts = [];
+        let totalTimeCostHours = 0;
+        let sequenceStopped = false;
+        let workingPlayer = {
+          ...player,
+          hp: nextHp,
+          current_floor: player.current_floor,
+          current_area: nextArea
+        };
+
+        for (const step of textPlan.steps) {
+          if (sequenceStopped) break;
+
+          const stepResolution = await resolveTextAction(conn, {
+            player: workingPlayer,
+            input: step.input,
+            interpretation: step,
+            enemy: encounteredEnemy,
+            boss: encounteredBoss,
+            sceneTags,
+            remains: activeRemains
+          });
+
+          stepResolutions.push({
+            order: step.order,
+            input: step.input,
+            resolved_intent: stepResolution.resolved_intent,
+            resolution_type: stepResolution.resolution_type,
+            effect_applied: stepResolution.effect_applied,
+            cost: stepResolution.cost
+          });
+
+          totalTimeCostHours += Number(stepResolution.cost?.timeCostHours || 0);
+          nextHp = stepResolution.playerHpAfter ?? nextHp;
+          workingPlayer = {
+            ...workingPlayer,
+            hp: nextHp,
+            current_floor: player.current_floor,
+            current_area: nextArea
+          };
+          outcomeParts.push(stepResolution.narrationOutcome);
+
+          if (step.intent === "escape") {
+            const escapeEffect = stepResolution.effect_applied;
+
+            if (escapeEffect?.moved) {
+              nextArea = getEscapeDestination(player, nextArea, stepResolution.resolution_type);
+              workingPlayer.current_area = nextArea;
+              escapeEffect.destination = nextArea;
+              stepResolutions[stepResolutions.length - 1].effect_applied.destination = nextArea;
+            }
+
+            if (escapeEffect?.escaped) {
+              if (encounteredBoss && encounteredBoss.encounter_state === "active") {
+                await markBossEscaped(conn, player.id);
+                encounteredBoss = null;
+              }
+
+              if (encounteredEnemy && encounteredEnemy.encounter_state === "active") {
+                await markEnemyEscaped(conn, player.id);
+                encounteredEnemy = null;
+              }
+            }
+
+            sceneTitle = escapeEffect?.escaped
+              ? "Escape Into Safer Ground"
+              : escapeEffect?.reached_temporary_safety
+                ? "A Desperate Withdrawal"
+                : "Escape Denied";
+            sceneType = escapeEffect?.escaped
+              ? "escape"
+              : escapeEffect?.reached_temporary_safety
+                ? "evasion"
+                : "danger";
+            outcomeParts.push(`The escape attempt ends at ${nextArea}. Safety state: ${escapeEffect?.safety_state || "unknown"}.`);
+
+            if (stepResolution.playerHpAfter <= 0) {
+              textActionDefeatedPlayer = true;
+              await triggerDeathFlow(conn, player, "Killed while trying to escape");
+              nextHp = 0;
+              sceneType = "death";
+              sceneTitle = "Death";
+            }
+
+            sequenceStopped = true;
+            continue;
+          }
+
+          if (stepResolution.resolution_type === "invalid_attempt") {
+            sequenceStopped = true;
+            sceneTitle = "Interrupted Plan";
+            sceneType = "invalid_action";
+            outcomeParts.push("The sequence stops because that step cannot be executed.");
+            continue;
+          }
+
+          if (stepResolution.battleResult) {
+            battleResult = stepResolution.battleResult;
+            sequenceStopped = true;
+            continue;
+          }
+
+          if (step.intent === "move_toward_objective") {
+            const areaPool = getAreaPool(player.current_floor);
+            nextArea = areaPool[Math.floor(Math.random() * areaPool.length)];
+            workingPlayer.current_area = nextArea;
+            sceneTitle = step.objective === "boss_room" ? "Toward the Boss Seal" : "A Purposeful Advance";
+            sceneType = "progression";
+            outcomeParts.push(`The player advances into ${nextArea}.`);
+          }
+
+          const progressionActionKey = ["map_area", "scout_area"].includes(step.intent)
+            ? "look"
+            : step.intent === "move_toward_objective"
+              ? "move"
+              : null;
+
+          if (progressionActionKey && !encounteredEnemy && !encounteredBoss) {
+            dungeonProgression = await resolveDungeonProgression(conn, {
+              player: workingPlayer,
+              actionKey: progressionActionKey,
+              hasActiveEnemy: false,
+              hasActiveBoss: false
+            });
+
+            if (dungeonProgression.next_floor) {
+              player.current_floor = dungeonProgression.next_floor;
+              workingPlayer.current_floor = dungeonProgression.next_floor;
+              nextArea = dungeonProgression.next_area || nextArea;
+              workingPlayer.current_area = nextArea;
+              sceneType = "progression";
+              sceneTitle = "A Hidden Route Opens";
+            }
+
+            if (dungeonProgression.message) {
+              outcomeParts.push(dungeonProgression.message);
+            }
+
+            if (dungeonProgression.trigger_boss) {
+              encounteredBoss = await startBossEncounter(conn, player.id, player.current_floor, {
+                triggerKey: dungeonProgression.boss_trigger_key
+              });
+              encounteredEnemy = null;
+              sceneType = "boss_encounter";
+              sceneTitle = "The Floor Guardian Appears";
+              outcomeParts.push("The plan stops as the floor guardian answers the route.");
+              sequenceStopped = true;
+              continue;
+            }
+          }
+
+          if (!encounteredEnemy && !encounteredBoss && progressionActionKey && shouldEncounterEnemy(progressionActionKey)) {
+            const roll = Math.random();
+
+            if (roll < 0.45) {
+              const generated = await resolveEnemyEncounter(conn, {
+                playerId: player.id,
+                floor: player.current_floor,
+                area: nextArea,
+                progressionTrigger: dungeonProgression.event_key,
+                encounterState: "active"
+              });
+
+              encounteredEnemy = generated.enemy;
+              enemyWasNew = generated.isNew;
+
+              await markEnemyDiscovered(conn, player.id, encounteredEnemy.enemy_id || encounteredEnemy.id);
+              await setCurrentEnemy(conn, player.id, encounteredEnemy);
+
+              sceneType = "encounter";
+              sceneTitle = enemyWasNew
+                ? "A New Presence Emerges"
+                : "A Familiar Threat Returns";
+
+              outcomeParts.push(enemyWasNew
+                ? `A new enemy appears for the first time: ${encounteredEnemy.name}.`
+                : `An enemy appears: ${encounteredEnemy.name}.`);
+              sequenceStopped = true;
+            }
+          }
+        }
+
+        const terminalStep = stepResolutions[stepResolutions.length - 1];
+
+        textResolution = {
+          input: actionInput,
+          normalized: "typed",
+          resolved_intent: "sequence",
+          resolution_type: battleResult
+            ? battleResult.resultTag
+            : stepResolutions.some((step) => step.resolution_type === "invalid_attempt")
+              ? "partial_sequence"
+              : terminalStep?.resolution_type || "success",
+          effect_applied: {
+            type: "sequence",
+            steps: stepResolutions,
+            stopped_early: sequenceStopped,
+            final_area: nextArea,
+            final_floor: player.current_floor
+          },
+          battleResult,
+          playerHpAfter: nextHp,
+          enemyHpAfter: battleResult?.enemyHpAfter ?? null,
+          cost: {
+            timeCostHours: Math.max(1, totalTimeCostHours),
+            hpRiskCost: stepResolutions.reduce((sum, step) => sum + Number(step.cost?.hpRiskCost || 0), 0)
+          },
+          narrationOutcome: outcomeParts.filter(Boolean).join(" ")
+        };
+      } else {
+        textInterpretation = textPlan.steps[0] || interpretTextAction(actionInput, {
+          player,
+          currentScene,
+          enemy: encounteredEnemy,
+          boss: encounteredBoss,
+          sceneTags
+        });
+
+        textResolution = await resolveTextAction(conn, {
+          player,
+          input: actionInput,
+          interpretation: textInterpretation,
+          enemy: encounteredEnemy,
+          boss: encounteredBoss,
+          sceneTags,
+          remains: activeRemains
+        });
+
+        if (textInterpretation.action_key) {
+          actionKey = textInterpretation.action_key;
+        }
+
+        if (textInterpretation.intent === "move_toward_objective") {
+          const areaPool = getAreaPool(player.current_floor);
+          nextArea = areaPool[Math.floor(Math.random() * areaPool.length)];
+          sceneTitle = textInterpretation.objective === "boss_room" ? "Toward the Boss Seal" : "A Purposeful Advance";
+          sceneType = "progression";
+          textResolution.narrationOutcome = `${textResolution.narrationOutcome} The player advances into ${nextArea}.`;
+        } else if (textInterpretation.intent === "escape") {
+          const escapeEffect = textResolution.effect_applied;
+
+          if (escapeEffect?.moved) {
+            nextArea = getEscapeDestination(player, nextArea, textResolution.resolution_type);
+            escapeEffect.destination = nextArea;
+            textResolution.narrationOutcome = `${textResolution.narrationOutcome} The escape attempt ends at ${nextArea}.`;
+          }
+
+          if (escapeEffect?.escaped) {
+            if (encounteredBoss && encounteredBoss.encounter_state === "active") {
+              await markBossEscaped(conn, player.id);
+              encounteredBoss = null;
+            }
+
+            if (encounteredEnemy && encounteredEnemy.encounter_state === "active") {
+              await markEnemyEscaped(conn, player.id);
+              encounteredEnemy = null;
+            }
+          }
+
+          sceneTitle = escapeEffect?.escaped
+            ? "Escape Into Safer Ground"
+            : escapeEffect?.reached_temporary_safety
+              ? "A Desperate Withdrawal"
+              : "Escape Denied";
+          sceneType = escapeEffect?.escaped
+            ? "escape"
+            : escapeEffect?.reached_temporary_safety
+              ? "evasion"
+              : "danger";
+          suppressDungeonProgression = true;
+
+          if (textResolution.playerHpAfter <= 0) {
+            textActionDefeatedPlayer = true;
+            await triggerDeathFlow(conn, player, "Killed while trying to escape");
+            nextHp = 0;
+            sceneType = "death";
+            sceneTitle = "Death";
+          }
+        }
+      }
+
+      await logTextActionInterpretation(conn, {
+        playerId: player.id,
+        actionText: actionInput,
+        interpretation: textInterpretation,
+        resolution: textResolution
+      });
+
+      suppressDungeonProgression = textPlan.is_sequence
+        || textResolution.resolution_type === "invalid_attempt"
+        || ["rest", "escape", "plan_next_move", "sequence"].includes(textResolution.resolved_intent);
+      battleResult = textResolution.battleResult;
+      nextHp = textResolution.playerHpAfter ?? nextHp;
+      systemOutcome = textResolution.narrationOutcome;
+
+      if (textResolution.resolution_type === "invalid_attempt") {
+        sceneTitle = "Impossible Attempt";
+        sceneType = "invalid_action";
+      }
+
+      if (battleResult && encounteredBoss && encounteredBoss.encounter_state === "active") {
+        sceneType = "boss_battle";
+        sceneTitle = "Improvised Boss Clash";
+
+        await updateBossHp(conn, player.id, battleResult.enemyHpAfter, battleResult.resultTag);
+        await logBossBattle(conn, {
+          playerId: player.id,
+          bossId: encounteredBoss.boss_id,
+          battleResult
+        });
+
+        if (battleResult.resultTag === "enemy_defeated") {
+          const expReward = Number(encounteredBoss.reward_exp || 0);
+          defeatedBoss = encounteredBoss;
+          defeatedEnemy = {
+            name: encounteredBoss.name,
+            enemy_type: "boss"
+          };
+
+          progression = applyExpGain(player, expReward);
+
+          await conn.query(
+            `UPDATE players
+             SET exp = ?, level = ?, stat_points = ?, hp = ?
+             WHERE id = ?`,
+            [
+              progression.exp,
+              progression.level,
+              progression.stat_points,
+              nextHp,
+              player.id
+            ]
+          );
+
+          await markBossDefeated(conn, player, encounteredBoss);
+          const bossProgression = await markFloorBossDefeated(conn, player.id, encounteredBoss.floor_number);
+          await createRemains(conn, {
+            playerId: player.id,
+            enemyName: encounteredBoss.name,
+            enemyType: "boss",
+            sourceType: "boss",
+            sourceId: encounteredBoss.boss_id
+          });
+          await clearCurrentBoss(conn, player.id);
+
+          if (bossProgression.dungeon_completed) {
+            finalAscension = await startFinalAscension(conn, player, bossProgression.completed_floor);
+            sceneType = "ascension";
+            sceneTitle = "Final Ascension";
+            systemOutcome = `${systemOutcome} The improvised action defeats the final boss ${encounteredBoss.name}. Floor 100 is clear. State your wish.`;
+          } else {
+            systemOutcome = progression.levels_gained > 0
+              ? `${systemOutcome} ${encounteredBoss.name} falls. The floor seal breaks, ${expReward} EXP is gained, and the player levels up.`
+              : `${systemOutcome} ${encounteredBoss.name} falls. The floor seal breaks and ${expReward} EXP is gained.`;
+          }
+        } else if (battleResult.resultTag === "player_defeated") {
+          systemOutcome = `${systemOutcome} ${encounteredBoss.name} kills the player.`;
+          await triggerDeathFlow(conn, player, `Killed by boss during typed action: ${encounteredBoss.name}`);
+          nextHp = 0;
+          sceneType = "death";
+          sceneTitle = "Death";
+        } else if (battleResult.resultTag === "double_ko") {
+          defeatedBoss = encounteredBoss;
+          defeatedEnemy = {
+            name: encounteredBoss.name,
+            enemy_type: "boss"
+          };
+
+          await markBossDefeated(conn, player, encounteredBoss);
+          await markFloorBossDefeated(conn, player.id, encounteredBoss.floor_number);
+          await createRemains(conn, {
+            playerId: player.id,
+            enemyName: encounteredBoss.name,
+            enemyType: "boss",
+            sourceType: "boss",
+            sourceId: encounteredBoss.boss_id
+          });
+          await clearCurrentBoss(conn, player.id);
+          await triggerDeathFlow(conn, player, `Killed while defeating boss with typed action: ${encounteredBoss.name}`);
+
+          systemOutcome = `${systemOutcome} The player and ${encounteredBoss.name} destroy each other.`;
+          nextHp = 0;
+          sceneType = "death";
+          sceneTitle = "Death";
+        }
+
+        encounteredBoss = await getCurrentBoss(conn, player.id);
+      } else if (battleResult && encounteredEnemy && encounteredEnemy.encounter_state === "active") {
+        sceneType = "battle";
+        sceneTitle = "Improvised Clash";
+
+        await conn.query(
+          `UPDATE player_current_enemy
+           SET enemy_current_hp = ?, encounter_state = ?
+           WHERE player_id = ?`,
+          [
+            battleResult.enemyHpAfter,
+            battleResult.resultTag === "enemy_defeated" || battleResult.resultTag === "double_ko" ? "defeated" : "active",
+            player.id
+          ]
+        );
+
+        await conn.query(
+          `INSERT INTO battle_logs (
+            player_id,
+            enemy_id,
+            player_action,
+            enemy_action,
+            player_damage_dealt,
+            enemy_damage_dealt,
+            player_hp_after,
+            enemy_hp_after,
+            result_tag
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            player.id,
+            encounteredEnemy.enemy_id,
+            battleResult.playerAction,
+            battleResult.enemyAction,
+            battleResult.playerDamageDealt,
+            battleResult.enemyDamageDealt,
+            battleResult.playerHpAfter,
+            battleResult.enemyHpAfter,
+            battleResult.resultTag
+          ]
+        );
+
+        if (battleResult.resultTag === "enemy_defeated") {
+          const expReward = Number(encounteredEnemy.reward_exp || 0);
+          defeatedEnemy = encounteredEnemy;
+
+          progression = applyExpGain(player, expReward);
+
+          await conn.query(
+            `UPDATE players
+             SET exp = ?, level = ?, stat_points = ?, hp = ?
+             WHERE id = ?`,
+            [
+              progression.exp,
+              progression.level,
+              progression.stat_points,
+              nextHp,
+              player.id
+            ]
+          );
+
+          systemOutcome = progression.levels_gained > 0
+            ? `${systemOutcome} ${encounteredEnemy.name} is defeated. The player gains ${expReward} EXP and levels up.`
+            : `${systemOutcome} ${encounteredEnemy.name} is defeated. The player gains ${expReward} EXP.`;
+
+          await createRemains(conn, {
+            playerId: player.id,
+            enemyName: encounteredEnemy.name,
+            enemyType: encounteredEnemy.enemy_type,
+            sourceType: "enemy",
+            sourceId: encounteredEnemy.enemy_id || encounteredEnemy.id
+          });
+          await clearCurrentEnemy(conn, player.id);
+        } else if (battleResult.resultTag === "player_defeated") {
+          systemOutcome = `${systemOutcome} ${encounteredEnemy.name} overpowers the player.`;
+          await triggerDeathFlow(conn, player, `Killed by enemy during typed action: ${encounteredEnemy.name}`);
+          nextHp = 0;
+          sceneType = "death";
+          sceneTitle = "Death";
+        } else if (battleResult.resultTag === "double_ko") {
+          systemOutcome = `${systemOutcome} Both the player and ${encounteredEnemy.name} fall.`;
+          defeatedEnemy = encounteredEnemy;
+          await createRemains(conn, {
+            playerId: player.id,
+            enemyName: encounteredEnemy.name,
+            enemyType: encounteredEnemy.enemy_type,
+            sourceType: "enemy",
+            sourceId: encounteredEnemy.enemy_id || encounteredEnemy.id
+          });
+          await clearCurrentEnemy(conn, player.id);
+          await triggerDeathFlow(conn, player, `Killed while defeating enemy with typed action: ${encounteredEnemy.name}`);
+          nextHp = 0;
+          sceneType = "death";
+          sceneTitle = "Death";
+        }
+
+        const refreshedEnemy = await getCurrentEnemy(conn, player.id);
+        encounteredEnemy = refreshedEnemy;
+      }
     }
 
-    if (!battleResult) {
+    if (!battleResult && !suppressDungeonProgression) {
       dungeonProgression = await resolveDungeonProgression(conn, {
         player,
         actionKey,
@@ -432,7 +1032,7 @@ router.post("/", authenticateToken, async (req, res) => {
       }
     }
 
-    if (!encounteredEnemy && !encounteredBoss && shouldEncounterEnemy(actionKey)) {
+    if (!encounteredEnemy && !encounteredBoss && !suppressDungeonProgression && shouldEncounterEnemy(actionKey)) {
       const roll = Math.random();
 
       if (roll < 0.45) {
@@ -461,7 +1061,7 @@ router.post("/", authenticateToken, async (req, res) => {
       }
     }
 
-    const hoursToAdd = getActionTimeCost(actionKey);
+    const hoursToAdd = textResolution?.cost?.timeCostHours ?? getActionTimeCost(actionKey);
 
     const nextTime = applyTime({
       year: player.year_survived,
@@ -498,7 +1098,9 @@ router.post("/", authenticateToken, async (req, res) => {
       playerId: player.id,
       actionKey,
       actionInput,
-      defeatedEnemy
+      defeatedEnemy,
+      textResolution,
+      textInterpretation
     });
 
     skillProgression = await evaluateSkillProgression(conn, {
@@ -508,10 +1110,48 @@ router.post("/", authenticateToken, async (req, res) => {
     });
 
     const skillContext = await getPlayerSkillContext(conn, player.id);
+    const escapeEffect = textResolution?.effect_applied?.type === "escape"
+      ? textResolution.effect_applied
+      : textResolution?.effect_applied?.steps?.find((step) => step.effect_applied?.type === "escape")?.effect_applied || null;
+
+    eventFeedback = {
+      location: {
+        before: player.current_area,
+        after: nextArea,
+        floor: player.current_floor,
+        time_of_day: timeOfDay,
+        scene_tags: sceneTags
+      },
+      action: {
+        input: actionInput,
+        normalized: actionKey,
+        resolved_intent: textResolution?.resolved_intent || actionKey,
+        resolution_type: textResolution?.resolution_type || (battleResult ? battleResult.resultTag : "success")
+      },
+      consequences: {
+        hp_before: player.hp,
+        hp_after: nextHp,
+        hp_delta: Number(nextHp || 0) - Number(player.hp || 0),
+        safety_state: escapeEffect?.safety_state || null,
+        moved: player.current_area !== nextArea,
+        enemy_state: encounteredEnemy
+          ? "active"
+          : escapeEffect?.escaped && escapeEffect?.enemy_pressure?.type === "enemy"
+            ? "escaped"
+            : null,
+        boss_state: encounteredBoss
+          ? "active"
+          : escapeEffect?.escaped && escapeEffect?.enemy_pressure?.type === "boss"
+            ? "escaped"
+            : null,
+        world_change: dungeonProgression.event_key || "none"
+      }
+    };
 
     const context = {
       action: actionInput,
       outcome: systemOutcome,
+      event_feedback: eventFeedback,
       environment: {
         area: nextArea,
         time_of_day: timeOfDay
@@ -523,6 +1163,7 @@ router.post("/", authenticateToken, async (req, res) => {
         exp: progression ? progression.exp : player.exp,
         stat_points: progression ? progression.stat_points : player.stat_points,
         is_alive:
+          textActionDefeatedPlayer ||
           battleResult?.resultTag === "player_defeated" ||
           battleResult?.resultTag === "double_ko"
             ? 0
@@ -543,6 +1184,18 @@ router.post("/", authenticateToken, async (req, res) => {
         dynamic_created: skillProgression.dynamic_skill_keys
       },
       dungeon_progression: dungeonProgression,
+      text_action: textResolution
+        ? {
+            input: textResolution.input,
+            normalized: textResolution.normalized,
+            resolved_intent: textResolution.resolved_intent,
+            resolution_type: textResolution.resolution_type,
+            effect_applied: textResolution.effect_applied,
+            interpretation: textInterpretation,
+            scene_tags: sceneTags,
+            cost: textResolution.cost
+          }
+        : null,
       final_ascension: finalAscension
         ? {
             prompt: "State your wish.",
@@ -662,7 +1315,10 @@ router.post("/", authenticateToken, async (req, res) => {
       action: {
         input: actionInput,
         normalized: actionKey,
-        time_cost_hours: hoursToAdd
+        time_cost_hours: hoursToAdd,
+        resolved_intent: textResolution?.resolved_intent || actionKey,
+        resolution_type: textResolution?.resolution_type || (battleResult ? battleResult.resultTag : "success"),
+        effect_applied: textResolution?.effect_applied || null
       },
       scene: {
         title: sceneTitle,
@@ -678,6 +1334,7 @@ router.post("/", authenticateToken, async (req, res) => {
         exp: progression ? progression.exp : player.exp,
         stat_points: progression ? progression.stat_points : player.stat_points,
         is_alive:
+          textActionDefeatedPlayer ||
           battleResult?.resultTag === "player_defeated" ||
           battleResult?.resultTag === "double_ko"
             ? 0
@@ -691,6 +1348,7 @@ router.post("/", authenticateToken, async (req, res) => {
         floor: player.current_floor,
         area: nextArea
       },
+      event_feedback: eventFeedback,
       enemy: encounteredEnemy
         ? {
             id: encounteredEnemy.enemy_id || encounteredEnemy.id,
@@ -719,6 +1377,18 @@ router.post("/", authenticateToken, async (req, res) => {
       battle: battleResult || null,
       progression: progression || null,
       dungeon_progression: dungeonProgression,
+      text_action: textResolution
+        ? {
+            input: textResolution.input,
+            normalized: textResolution.normalized,
+            resolved_intent: textResolution.resolved_intent,
+            resolution_type: textResolution.resolution_type,
+            effect_applied: textResolution.effect_applied,
+            interpretation: textInterpretation,
+            scene_tags: sceneTags,
+            cost: textResolution.cost
+          }
+        : null,
       final_ascension: finalAscension
         ? {
             prompt: "State your wish.",

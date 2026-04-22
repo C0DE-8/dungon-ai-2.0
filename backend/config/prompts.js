@@ -55,6 +55,9 @@ STRICT RULES:
 - Do NOT override backend decisions.
 - Use only the provided context.
 - Narration must reflect only what just happened.
+- Narration must name or clearly evoke the current location/area when available.
+- Narration must show the action, the immediate effect, and visible consequences from event_feedback when available.
+- For escape, hiding, scouting, resting, or movement actions, describe whether the player moved, reached safety, remained threatened, took damage, or changed enemy distance.
 - Choices must be based on the current situation, environment, and outcome.
 - Do NOT give generic choices unless they truly fit the moment.
 - Do NOT give impossible, future-state, overpowered, or unrelated choices.

@@ -3,14 +3,26 @@ const BASE_CONDITION_STATS = [
   "times_hidden",
   "times_rested",
   "times_appraised",
-  "typed_actions_count"
+  "typed_actions_count",
+  "intent:precision_attack",
+  "intent:environment_attack",
+  "intent:hide",
+  "intent:escape",
+  "intent:devour_remains",
+  "intent:social",
+  "risk:high"
 ];
 
 const DYNAMIC_THRESHOLDS = {
   enemySlayer: 3,
   enemyTypeSlayer: 5,
   stealth: 5,
-  creativeTyped: 8
+  creativeTyped: 8,
+  precision: 4,
+  environment: 4,
+  devour: 3,
+  social: 4,
+  reckless: 5
 };
 
 function slugify(value = "") {
@@ -97,7 +109,7 @@ async function incrementConditionStat(conn, playerId, statKey, amount = 1, metad
   return stat || null;
 }
 
-async function trackActionBehavior(conn, { playerId, actionKey, actionInput, defeatedEnemy }) {
+async function trackActionBehavior(conn, { playerId, actionKey, actionInput, defeatedEnemy, textResolution, textInterpretation }) {
   await ensurePlayerConditionStats(conn, playerId);
 
   const changedStats = [];
@@ -119,9 +131,54 @@ async function trackActionBehavior(conn, { playerId, actionKey, actionInput, def
     await increment("times_appraised");
   }
 
-  if (actionKey === "typed") {
+  if (actionKey === "typed" || textInterpretation) {
     await increment("typed_actions_count", 1, {
       last_action: String(actionInput || "").slice(0, 240)
+    });
+  }
+
+  const textActionSteps = Array.isArray(textInterpretation?.steps)
+    ? textInterpretation.steps
+    : textInterpretation?.intent
+      ? [textInterpretation]
+      : [];
+  const textActionWasPlayable = textActionSteps.length > 0 && textResolution?.resolution_type !== "invalid_attempt";
+
+  if (textActionWasPlayable && actionKey !== "hide" && textActionSteps.some((step) => step.intent === "hide")) {
+    await increment("times_hidden", 1, {
+      source: "typed_intent"
+    });
+  }
+
+  if (textActionWasPlayable && actionKey !== "rest" && textActionSteps.some((step) => step.intent === "rest")) {
+    await increment("times_rested", 1, {
+      source: "typed_intent"
+    });
+  }
+
+  if (textActionWasPlayable && actionKey !== "appraise" && textActionSteps.some((step) => step.intent === "plan_next_move")) {
+    await increment("times_appraised", 1, {
+      source: "typed_intent"
+    });
+  }
+
+  if (textActionWasPlayable) {
+    for (const step of textActionSteps) {
+      if (!step.intent || step.intent === "invalid") continue;
+
+      await increment(`intent:${step.intent}`, 1, {
+        last_action: String(step.input || actionInput || "").slice(0, 240),
+        approach: step.approach || null,
+        risk_level: step.risk_level || null,
+        resolution_type: textResolution?.resolution_type || null
+      });
+    }
+  }
+
+  if (textActionWasPlayable && textActionSteps.some((step) => step.risk_level === "high")) {
+    await increment("risk:high", 1, {
+      last_intent: textActionSteps.find((step) => step.risk_level === "high")?.intent || null,
+      resolution_type: textResolution?.resolution_type || null
     });
   }
 
@@ -267,6 +324,100 @@ async function createDynamicSkillsFromPatterns(conn, playerId, changedStats = []
           analysis_window_turns: 1
         },
         source_pattern: "creative_typed_actions"
+      };
+
+      const wasCreated = await insertDynamicSkill(conn, skill);
+      if (wasCreated) createdSkills.push(skill.skill_key);
+    }
+
+    if (statKey === "intent:precision_attack" && statValue >= DYNAMIC_THRESHOLDS.precision) {
+      const skill = {
+        skill_key: "dynamic_weakpoint_reader",
+        name: "Weakpoint Reader",
+        description: "A passive precision skill formed from repeatedly aiming for vulnerable points.",
+        skill_type: "passive",
+        condition_stat_key: "intent:precision_attack",
+        condition_threshold: DYNAMIC_THRESHOLDS.precision,
+        effect: {
+          precision_damage_bonus: 1,
+          weakpoint_accuracy_bonus: 1
+        },
+        source_pattern: "repeated_precision_intent"
+      };
+
+      const wasCreated = await insertDynamicSkill(conn, skill);
+      if (wasCreated) createdSkills.push(skill.skill_key);
+    }
+
+    if (statKey === "intent:environment_attack" && statValue >= DYNAMIC_THRESHOLDS.environment) {
+      const skill = {
+        skill_key: "dynamic_room_weaponizer",
+        name: "Room Weaponizer",
+        description: "A passive tactical skill formed from repeatedly turning the environment into a weapon.",
+        skill_type: "passive",
+        condition_stat_key: "intent:environment_attack",
+        condition_threshold: DYNAMIC_THRESHOLDS.environment,
+        effect: {
+          environmental_damage_bonus: 1,
+          environmental_risk_reduction: 1
+        },
+        source_pattern: "repeated_environment_intent"
+      };
+
+      const wasCreated = await insertDynamicSkill(conn, skill);
+      if (wasCreated) createdSkills.push(skill.skill_key);
+    }
+
+    if (statKey === "intent:devour_remains" && statValue >= DYNAMIC_THRESHOLDS.devour) {
+      const skill = {
+        skill_key: "dynamic_predator_metabolism",
+        name: "Predator Metabolism",
+        description: "A passive devour skill formed from repeatedly consuming defeated enemies.",
+        skill_type: "passive",
+        condition_stat_key: "intent:devour_remains",
+        condition_threshold: DYNAMIC_THRESHOLDS.devour,
+        effect: {
+          devour_healing_bonus: 1
+        },
+        source_pattern: "repeated_devour_intent"
+      };
+
+      const wasCreated = await insertDynamicSkill(conn, skill);
+      if (wasCreated) createdSkills.push(skill.skill_key);
+    }
+
+    if (statKey === "intent:social" && statValue >= DYNAMIC_THRESHOLDS.social) {
+      const skill = {
+        skill_key: "dynamic_creature_reader",
+        name: "Creature Reader",
+        description: "An active social skill formed from repeated attempts to communicate with dungeon creatures.",
+        skill_type: "active",
+        condition_stat_key: "intent:social",
+        condition_threshold: DYNAMIC_THRESHOLDS.social,
+        effect: {
+          social_opening_bonus: 1,
+          duration_turns: 1
+        },
+        source_pattern: "repeated_social_intent"
+      };
+
+      const wasCreated = await insertDynamicSkill(conn, skill);
+      if (wasCreated) createdSkills.push(skill.skill_key);
+    }
+
+    if (statKey === "risk:high" && statValue >= DYNAMIC_THRESHOLDS.reckless) {
+      const skill = {
+        skill_key: "dynamic_berserker_commitment",
+        name: "Berserker Commitment",
+        description: "A passive combat skill formed from repeatedly choosing dangerous high-risk actions.",
+        skill_type: "passive",
+        condition_stat_key: "risk:high",
+        condition_threshold: DYNAMIC_THRESHOLDS.reckless,
+        effect: {
+          high_risk_damage_bonus: 1,
+          high_risk_backfire_penalty: 1
+        },
+        source_pattern: "repeated_high_risk_intent"
       };
 
       const wasCreated = await insertDynamicSkill(conn, skill);
