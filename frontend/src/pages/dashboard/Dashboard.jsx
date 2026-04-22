@@ -63,6 +63,7 @@ const Dashboard = () => {
   const [enemy, setEnemy] = useState(null);
   const [boss, setBoss] = useState(null);
   const [battle, setBattle] = useState(null);
+  const [eventFeedback, setEventFeedback] = useState(null);
   const [mode, setMode] = useState("dungeon");
   const [actionText, setActionText] = useState("");
   const [wishText, setWishText] = useState("");
@@ -142,6 +143,7 @@ const Dashboard = () => {
     setEnemy(data.enemy || null);
     setBoss(data.boss || null);
     setBattle(data.battle || null);
+    setEventFeedback(data.event_feedback || null);
 
     if (data.final_ascension) {
       setMode("ascension");
@@ -359,9 +361,26 @@ const Dashboard = () => {
 
             {battle && (
               <section className={styles.battlePanel}>
-                <span>Dealt {battle.player_damage_dealt ?? 0}</span>
-                <span>Took {battle.enemy_damage_dealt ?? 0}</span>
-                <span>{battle.result_tag || "battle"}</span>
+                {eventFeedback?.combat ? (
+                  <>
+                    <div className={styles.battleDetail}>
+                      <strong>{eventFeedback.combat.player_attempt}</strong>
+                      <span>{eventFeedback.combat.hit_result}</span>
+                      {eventFeedback.combat.enemy_reaction && <span>{eventFeedback.combat.enemy_reaction}</span>}
+                    </div>
+                    <div className={styles.battleStats}>
+                      <span>Dealt {battle.player_damage_dealt ?? 0}</span>
+                      <span>Took {battle.enemy_damage_dealt ?? 0}</span>
+                      <span>{battle.result_tag || "battle"}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <span>Dealt {battle.player_damage_dealt ?? 0}</span>
+                    <span>Took {battle.enemy_damage_dealt ?? 0}</span>
+                    <span>{battle.result_tag || "battle"}</span>
+                  </>
+                )}
               </section>
             )}
 

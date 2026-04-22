@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const pool = require("../config/db");
 const authenticateToken = require("../middleware/authMiddleware");
-const { generateNarration } = require("../services/aiEngine");
+const { generateActionPlan, generateNarration } = require("../services/aiEngine");
 const {
   getActionTimeCost,
   applyTime,
@@ -61,8 +61,12 @@ function getFallbackAreaName(player, label) {
   return `Floor ${Number(player.current_floor) || 1} ${label}`;
 }
 
-function getEscapeDestination(player, currentArea, resolutionType) {
+function getEscapeDestination(player, currentArea, resolutionType, worldReaction = null) {
   if (resolutionType === "success") {
+    if (worldReaction?.type === "vanished_into_cover") {
+      return getFallbackAreaName(player, "Hidden Refuge");
+    }
+
     if (String(currentArea || "").toLowerCase().includes("sealed")) {
       return getFallbackAreaName(player, "Quiet Seal Alcove");
     }
@@ -75,10 +79,170 @@ function getEscapeDestination(player, currentArea, resolutionType) {
   }
 
   if (resolutionType === "partial_success") {
+    if (worldReaction?.type === "rerouted") {
+      return getFallbackAreaName(player, "Rerouted Side Passage");
+    }
+
+    if (worldReaction?.type === "chased") {
+      return getFallbackAreaName(player, "Pressured Escape Route");
+    }
+
     return getFallbackAreaName(player, "Temporary Cover");
   }
 
   return currentArea;
+}
+
+function getTypedSceneMeta(intent, resolutionType = "success") {
+  if (resolutionType === "invalid_attempt") {
+    return { title: "Impossible Attempt", type: "invalid_action" };
+  }
+
+  const metaByIntent = {
+    rest: { title: "Recovery Rest", type: "recovery" },
+    map_area: { title: "Mapping the Area", type: "exploration" },
+    scout_area: { title: "Scouting the Area", type: "exploration" },
+    plan_next_move: { title: "Tactical Planning", type: "utility" },
+    move_toward_objective: { title: "Purposeful Advance", type: "progression" },
+    observe: { title: "Measured Observation", type: "utility" },
+    hide: { title: "Taking Cover", type: "stealth" },
+    defend: { title: "Defensive Stance", type: "defense" },
+    environment_control: { title: "Using the Terrain", type: "environment" },
+    force_object: { title: "Forcing the Way", type: "environment" },
+    loot_remains: { title: "Searching the Remains", type: "loot" },
+    inspect_remains: { title: "Studying the Remains", type: "investigation" },
+    devour_remains: { title: "Predatory Recovery", type: "survival" },
+    social: { title: "Attempted Parley", type: "social" },
+    direct_attack: { title: "Improvised Attack", type: "battle" },
+    precision_attack: { title: "Targeted Strike", type: "battle" },
+    heavy_attack: { title: "Heavy Strike", type: "battle" },
+    environment_attack: { title: "Environmental Attack", type: "battle" }
+  };
+
+  if (intent === "sequence") {
+    return { title: "Action Sequence", type: "action_sequence" };
+  }
+
+  return metaByIntent[intent] || { title: "Player Action", type: "action" };
+}
+
+function describePlayerCombatAction(actionInput, intent, effect = {}) {
+  const rawInput = String(actionInput || "").trim();
+  const target = effect.target ? ` using ${String(effect.target).replace(/_/g, " ")}` : "";
+
+  if (rawInput && !["attack", "defend"].includes(rawInput.toLowerCase())) {
+    return `The player attempts to ${rawInput}.`;
+  }
+
+  if (intent === "precision_attack") {
+    return "The player commits to a precise strike aimed at a vulnerable opening.";
+  }
+
+  if (intent === "heavy_attack") {
+    return "The player throws weight into a heavy, forceful blow.";
+  }
+
+  if (intent === "environment_attack") {
+    return `The player turns the room itself into a weapon${target}.`;
+  }
+
+  if (intent === "defend") {
+    return "The player braces and tries to absorb the incoming attack.";
+  }
+
+  if (intent === "hide") {
+    return "The player tries to break the enemy's line of sight and fight from cover.";
+  }
+
+  return "The player closes distance and attacks directly.";
+}
+
+function describeEnemyRetaliation(opponent, battleResult, effect = {}) {
+  if (!opponent || !battleResult) return null;
+
+  const enemyName = opponent.name || "The enemy";
+  const damage = Number(battleResult.enemyDamageDealt || effect.enemy_damage || 0);
+
+  if (battleResult.resultTag === "enemy_defeated") {
+    return `${enemyName} fails to answer before collapsing.`;
+  }
+
+  if (damage <= 0) {
+    return `${enemyName} retaliates, but the player avoids meaningful damage.`;
+  }
+
+  if (Number(opponent.speed_stat || 0) >= 5) {
+    return `${enemyName} snaps back quickly and catches the player during recovery.`;
+  }
+
+  if (Number(opponent.attack_stat || 0) >= 6) {
+    return `${enemyName} answers with a hard counterblow.`;
+  }
+
+  return `${enemyName} claws back in close quarters.`;
+}
+
+function getCombatOpponent({ encounteredEnemy, encounteredBoss, defeatedEnemy, defeatedBoss }) {
+  if (encounteredBoss) return encounteredBoss;
+  if (encounteredEnemy) return encounteredEnemy;
+  if (defeatedBoss) return defeatedBoss;
+  if (defeatedEnemy) return defeatedEnemy;
+  return null;
+}
+
+function isCombatIntent(intent) {
+  return ["direct_attack", "precision_attack", "heavy_attack", "environment_attack"].includes(intent);
+}
+
+function enrichAiPlanStep(step, { enemy, boss, sceneTags }) {
+  const enriched = {
+    ...step,
+    tags_considered: sceneTags || [],
+    action_key: step.action_key || "typed"
+  };
+
+  if (["direct_attack", "precision_attack", "heavy_attack", "environment_attack", "social", "escape"].includes(enriched.intent)) {
+    enriched.secondary_target = boss ? "boss" : enemy ? "enemy" : enriched.secondary_target || null;
+  }
+
+  if (enriched.intent === "rest") {
+    enriched.action_key = "rest";
+    if (enriched.desired_full_recovery) {
+      enriched.requested_effect = "full_recovery";
+      enriched.rest_intensity = "full";
+    }
+  }
+
+  if (["map_area", "scout_area"].includes(enriched.intent)) {
+    enriched.action_key = "look";
+  }
+
+  if (enriched.intent === "plan_next_move") {
+    enriched.action_key = "appraise";
+  }
+
+  if (enriched.intent === "move_toward_objective" || enriched.intent === "escape") {
+    enriched.action_key = "move";
+  }
+
+  return enriched;
+}
+
+function enrichAiPlan(plan, context) {
+  if (!plan?.steps?.length) return null;
+
+  const steps = plan.steps.map((step, index) => ({
+    ...enrichAiPlanStep(step, context),
+    order: index + 1
+  }));
+
+  return {
+    ...plan,
+    intent: steps.length > 1 ? "sequence" : steps[0].intent,
+    is_sequence: steps.length > 1,
+    step_count: steps.length,
+    steps
+  };
 }
 
 async function clearCurrentEnemy(conn, playerId) {
@@ -484,8 +648,8 @@ router.post("/", authenticateToken, async (req, res) => {
       }
     } else {
       actionKey = "typed";
-      sceneTitle = "An Unscripted Move";
-      sceneType = "typed_action";
+      sceneTitle = "Player Action";
+      sceneType = "action";
 
       const activeRemains = await getActiveRemains(conn, player.id);
       sceneTags = deriveSceneTags({
@@ -504,7 +668,79 @@ router.post("/", authenticateToken, async (req, res) => {
         [player.id, player.current_area, JSON.stringify(sceneTags)]
       );
 
-      const textPlan = interpretTextActionPlan(actionInput, {
+      const plannerContext = {
+        player: {
+          hp: player.hp,
+          max_hp: player.max_hp,
+          level: player.level,
+          floor: player.current_floor,
+          area: player.current_area,
+          stats: {
+            strength: player.strength_stat,
+            dexterity: player.dexterity_stat,
+            stamina: player.stamina_stat,
+            intelligence: player.intelligence_stat,
+            charisma: player.charisma_stat,
+            wisdom: player.wisdom_stat
+          }
+        },
+        scene: currentScene
+          ? {
+              title: currentScene.scene_title,
+              text: currentScene.scene_text,
+              type: currentScene.scene_type
+            }
+          : null,
+        scene_tags: sceneTags,
+        active_enemy: encounteredEnemy
+          ? {
+              name: encounteredEnemy.name,
+              type: encounteredEnemy.enemy_type,
+              level: encounteredEnemy.level,
+              hp: encounteredEnemy.enemy_current_hp || encounteredEnemy.hp,
+              max_hp: encounteredEnemy.max_hp,
+              speed: encounteredEnemy.speed_stat,
+              attack: encounteredEnemy.attack_stat,
+              defense: encounteredEnemy.defense_stat,
+              description: encounteredEnemy.description
+            }
+          : null,
+        active_boss: encounteredBoss
+          ? {
+              name: encounteredBoss.name,
+              type: encounteredBoss.boss_type,
+              floor: encounteredBoss.floor_number,
+              level: encounteredBoss.level,
+              hp: encounteredBoss.boss_current_hp,
+              max_hp: encounteredBoss.max_hp,
+              speed: encounteredBoss.speed_stat,
+              attack: encounteredBoss.attack_stat,
+              defense: encounteredBoss.defense_stat,
+              description: encounteredBoss.description
+            }
+          : null,
+        remains: activeRemains.map((remain) => ({
+          enemy_name: remain.enemy_name,
+          enemy_type: remain.enemy_type,
+          loot_state: remain.loot_state,
+          inspect_state: remain.inspect_state
+        })),
+        guardrails: [
+          "Do not create real enemies unless active_enemy or active_boss exists; use scouting/planning for suspected enemies.",
+          "Backend validates damage, HP, time, movement, and enemy defeat.",
+          "Use environment_control for traps or setup before attack."
+        ]
+      };
+
+      const aiPlan = await generateActionPlan({
+        actionText: actionInput,
+        context: plannerContext
+      });
+      const textPlan = enrichAiPlan(aiPlan, {
+        enemy: encounteredEnemy,
+        boss: encounteredBoss,
+        sceneTags
+      }) || interpretTextActionPlan(actionInput, {
         player,
         currentScene,
         enemy: encounteredEnemy,
@@ -529,6 +765,24 @@ router.post("/", authenticateToken, async (req, res) => {
 
         for (const step of textPlan.steps) {
           if (sequenceStopped) break;
+
+          if (isCombatIntent(step.intent) && !encounteredEnemy && !encounteredBoss) {
+            const generated = await resolveEnemyEncounter(conn, {
+              playerId: player.id,
+              floor: player.current_floor,
+              area: nextArea,
+              progressionTrigger: "typed_combat_setup",
+              encounterState: "active"
+            });
+
+            encounteredEnemy = generated.enemy;
+            enemyWasNew = generated.isNew;
+
+            await markEnemyDiscovered(conn, player.id, encounteredEnemy.enemy_id || encounteredEnemy.id);
+            await setCurrentEnemy(conn, player.id, encounteredEnemy);
+
+            outcomeParts.push(`The setup draws ${encounteredEnemy.name} into reach.`);
+          }
 
           const stepResolution = await resolveTextAction(conn, {
             player: workingPlayer,
@@ -561,9 +815,10 @@ router.post("/", authenticateToken, async (req, res) => {
 
           if (step.intent === "escape") {
             const escapeEffect = stepResolution.effect_applied;
+            const worldReaction = escapeEffect?.world_reaction;
 
             if (escapeEffect?.moved) {
-              nextArea = getEscapeDestination(player, nextArea, stepResolution.resolution_type);
+              nextArea = getEscapeDestination(player, nextArea, stepResolution.resolution_type, worldReaction);
               workingPlayer.current_area = nextArea;
               escapeEffect.destination = nextArea;
               stepResolutions[stepResolutions.length - 1].effect_applied.destination = nextArea;
@@ -581,17 +836,17 @@ router.post("/", authenticateToken, async (req, res) => {
               }
             }
 
-            sceneTitle = escapeEffect?.escaped
+            sceneTitle = worldReaction?.label || (escapeEffect?.escaped
               ? "Escape Into Safer Ground"
               : escapeEffect?.reached_temporary_safety
                 ? "A Desperate Withdrawal"
-                : "Escape Denied";
+                : "Escape Denied");
             sceneType = escapeEffect?.escaped
               ? "escape"
               : escapeEffect?.reached_temporary_safety
                 ? "evasion"
                 : "danger";
-            outcomeParts.push(`The escape attempt ends at ${nextArea}. Safety state: ${escapeEffect?.safety_state || "unknown"}.`);
+            outcomeParts.push(`The escape attempt ends at ${nextArea}. Safety state: ${escapeEffect?.safety_state || "unknown"}. World reaction: ${worldReaction?.type || "none"}.`);
 
             if (stepResolution.playerHpAfter <= 0) {
               textActionDefeatedPlayer = true;
@@ -603,6 +858,17 @@ router.post("/", authenticateToken, async (req, res) => {
 
             sequenceStopped = true;
             continue;
+          }
+
+          if (stepResolution.effect_applied?.world_reaction) {
+            sceneTitle = stepResolution.effect_applied.world_reaction.label || "World Resistance";
+            sceneType = ["blocked", "interrupted"].includes(stepResolution.resolution_type) ? "danger" : "reaction";
+            outcomeParts.push(stepResolution.effect_applied.world_reaction.description);
+
+            if (["blocked", "interrupted"].includes(stepResolution.resolution_type)) {
+              sequenceStopped = true;
+              continue;
+            }
           }
 
           if (stepResolution.resolution_type === "invalid_attempt") {
@@ -619,7 +885,7 @@ router.post("/", authenticateToken, async (req, res) => {
             continue;
           }
 
-          if (step.intent === "move_toward_objective") {
+          if (step.intent === "move_toward_objective" && stepResolution.effect_applied?.moved !== false) {
             const areaPool = getAreaPool(player.current_floor);
             nextArea = areaPool[Math.floor(Math.random() * areaPool.length)];
             workingPlayer.current_area = nextArea;
@@ -749,17 +1015,12 @@ router.post("/", authenticateToken, async (req, res) => {
           actionKey = textInterpretation.action_key;
         }
 
-        if (textInterpretation.intent === "move_toward_objective") {
-          const areaPool = getAreaPool(player.current_floor);
-          nextArea = areaPool[Math.floor(Math.random() * areaPool.length)];
-          sceneTitle = textInterpretation.objective === "boss_room" ? "Toward the Boss Seal" : "A Purposeful Advance";
-          sceneType = "progression";
-          textResolution.narrationOutcome = `${textResolution.narrationOutcome} The player advances into ${nextArea}.`;
-        } else if (textInterpretation.intent === "escape") {
+        if (textInterpretation.intent === "escape") {
           const escapeEffect = textResolution.effect_applied;
+          const worldReaction = escapeEffect?.world_reaction;
 
           if (escapeEffect?.moved) {
-            nextArea = getEscapeDestination(player, nextArea, textResolution.resolution_type);
+            nextArea = getEscapeDestination(player, nextArea, textResolution.resolution_type, worldReaction);
             escapeEffect.destination = nextArea;
             textResolution.narrationOutcome = `${textResolution.narrationOutcome} The escape attempt ends at ${nextArea}.`;
           }
@@ -776,11 +1037,11 @@ router.post("/", authenticateToken, async (req, res) => {
             }
           }
 
-          sceneTitle = escapeEffect?.escaped
+          sceneTitle = worldReaction?.label || (escapeEffect?.escaped
             ? "Escape Into Safer Ground"
             : escapeEffect?.reached_temporary_safety
               ? "A Desperate Withdrawal"
-              : "Escape Denied";
+              : "Escape Denied");
           sceneType = escapeEffect?.escaped
             ? "escape"
             : escapeEffect?.reached_temporary_safety
@@ -794,6 +1055,46 @@ router.post("/", authenticateToken, async (req, res) => {
             nextHp = 0;
             sceneType = "death";
             sceneTitle = "Death";
+          }
+        } else if (textInterpretation.intent === "move_toward_objective" && textResolution.effect_applied?.moved !== false) {
+          const areaPool = getAreaPool(player.current_floor);
+          nextArea = areaPool[Math.floor(Math.random() * areaPool.length)];
+          sceneTitle = textInterpretation.objective === "boss_room" ? "Toward the Boss Seal" : "A Purposeful Advance";
+          sceneType = "progression";
+          textResolution.narrationOutcome = `${textResolution.narrationOutcome} The player advances into ${nextArea}.`;
+        } else if (textResolution.effect_applied?.world_reaction) {
+          sceneTitle = textResolution.effect_applied.world_reaction.label || "World Resistance";
+          sceneType = ["blocked", "interrupted"].includes(textResolution.resolution_type) ? "danger" : "reaction";
+        } else if (!textResolution.battleResult) {
+          const meta = getTypedSceneMeta(textInterpretation.intent, textResolution.resolution_type);
+          sceneTitle = meta.title;
+          sceneType = meta.type;
+
+          if (textInterpretation.intent === "rest") {
+            if (textResolution.effect_applied?.desired_full_recovery) {
+              sceneTitle = "Full Recovery Rest";
+            } else if (textResolution.effect_applied?.rest_intensity === "short") {
+              sceneTitle = "Short Nap";
+            }
+          }
+        }
+      }
+
+      if (sceneTitle === "Player Action" && sceneType === "action") {
+        const displayIntent = textInterpretation?.steps?.[0]?.intent || textInterpretation?.intent || textResolution.resolved_intent;
+        const meta = getTypedSceneMeta(displayIntent, textResolution.resolution_type);
+        sceneTitle = meta.title;
+        sceneType = meta.type;
+
+        if (displayIntent === "rest") {
+          const restEffect = textResolution.effect_applied?.type === "sequence"
+            ? textResolution.effect_applied.steps?.find((step) => step.resolved_intent === "rest")?.effect_applied
+            : textResolution.effect_applied;
+
+          if (restEffect?.desired_full_recovery) {
+            sceneTitle = "Full Recovery Rest";
+          } else if (restEffect?.rest_intensity === "short") {
+            sceneTitle = "Short Nap";
           }
         }
       }
@@ -812,9 +1113,17 @@ router.post("/", authenticateToken, async (req, res) => {
       nextHp = textResolution.playerHpAfter ?? nextHp;
       systemOutcome = textResolution.narrationOutcome;
 
+      if (!textActionDefeatedPlayer && !battleResult && textResolution && nextHp <= 0) {
+        textActionDefeatedPlayer = true;
+        await triggerDeathFlow(conn, player, `Killed during typed action: ${textResolution.resolved_intent}`);
+        sceneType = "death";
+        sceneTitle = "Death";
+      }
+
       if (textResolution.resolution_type === "invalid_attempt") {
-        sceneTitle = "Impossible Attempt";
-        sceneType = "invalid_action";
+        const meta = getTypedSceneMeta(textInterpretation?.intent, textResolution.resolution_type);
+        sceneTitle = meta.title;
+        sceneType = meta.type;
       }
 
       if (battleResult && encounteredBoss && encounteredBoss.encounter_state === "active") {
@@ -1113,6 +1422,40 @@ router.post("/", authenticateToken, async (req, res) => {
     const escapeEffect = textResolution?.effect_applied?.type === "escape"
       ? textResolution.effect_applied
       : textResolution?.effect_applied?.steps?.find((step) => step.effect_applied?.type === "escape")?.effect_applied || null;
+    const reactiveEffect = escapeEffect
+      || (textResolution?.effect_applied?.world_reaction ? textResolution.effect_applied : null)
+      || textResolution?.effect_applied?.steps?.find((step) => step.effect_applied?.world_reaction)?.effect_applied
+      || null;
+    const combatOpponent = getCombatOpponent({
+      encounteredEnemy,
+      encounteredBoss,
+      defeatedEnemy,
+      defeatedBoss
+    });
+    const combatEffect = textResolution?.effect_applied?.damage !== undefined
+      ? textResolution.effect_applied
+      : null;
+    const combatFeedback = battleResult
+      ? {
+          location: nextArea,
+          player_attempt: describePlayerCombatAction(
+            actionInput,
+            textResolution?.resolved_intent || battleResult.playerAction,
+            combatEffect || {}
+          ),
+          player_method: textResolution?.resolved_intent || battleResult.playerAction,
+          hit_result: battleResult.playerDamageDealt > 0
+            ? `The hit deals ${battleResult.playerDamageDealt} damage.`
+            : "The attack fails to deal damage.",
+          enemy_reaction: describeEnemyRetaliation(combatOpponent, battleResult, combatEffect || {}),
+          enemy_name: combatOpponent?.name || null,
+          enemy_hp_after: battleResult.enemyHpAfter,
+          enemy_damage_taken: battleResult.playerDamageDealt,
+          player_damage_taken: battleResult.enemyDamageDealt,
+          player_hp_after: battleResult.playerHpAfter,
+          result_tag: battleResult.resultTag
+        }
+      : null;
 
     eventFeedback = {
       location: {
@@ -1126,13 +1469,20 @@ router.post("/", authenticateToken, async (req, res) => {
         input: actionInput,
         normalized: actionKey,
         resolved_intent: textResolution?.resolved_intent || actionKey,
-        resolution_type: textResolution?.resolution_type || (battleResult ? battleResult.resultTag : "success")
+        resolution_type: textResolution?.resolution_type || (battleResult ? battleResult.resultTag : "success"),
+        attempted_method: combatFeedback?.player_attempt || null,
+        effect_summary: combatFeedback?.hit_result || systemOutcome
       },
       consequences: {
         hp_before: player.hp,
         hp_after: nextHp,
         hp_delta: Number(nextHp || 0) - Number(player.hp || 0),
-        safety_state: escapeEffect?.safety_state || null,
+        safety_state: reactiveEffect?.safety_state || null,
+        danger_level: reactiveEffect?.world_reaction?.danger_level || null,
+        world_reaction: reactiveEffect?.world_reaction?.type || null,
+        enemy_awareness: reactiveEffect?.world_reaction?.enemy_awareness || null,
+        movement_result: reactiveEffect?.world_reaction?.movement_result || null,
+        pressure_delta: reactiveEffect?.world_reaction?.pressure_delta || 0,
         moved: player.current_area !== nextArea,
         enemy_state: encounteredEnemy
           ? "active"
@@ -1145,7 +1495,8 @@ router.post("/", authenticateToken, async (req, res) => {
             ? "escaped"
             : null,
         world_change: dungeonProgression.event_key || "none"
-      }
+      },
+      combat: combatFeedback
     };
 
     const context = {

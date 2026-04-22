@@ -375,12 +375,32 @@
   background: #070707;
   color: #e5e5e5;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin: 0 0 22px;
   padding: 12px;
-  text-align: center;
   font-size: 0.9rem;
+}
+
+.battleStats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  text-align: center;
+}
+
+.battleDetail {
+  display: grid;
+  gap: 6px;
+  line-height: 1.4;
+}
+
+.battleDetail strong {
+  color: #fff;
+  font-size: 0.98rem;
+}
+
+.battleDetail span {
+  color: #cfcfcf;
 }
 
 .wishPanel {

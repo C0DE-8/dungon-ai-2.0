@@ -46,6 +46,10 @@ const TARGET_TAGS = {
   darkness: "dark_area",
   shadow: "dark_area",
   cover: "cover_available",
+  trap: "wall_present",
+  ambush: "cover_available",
+  chokepoint: "narrow_space",
+  passage: "narrow_space",
   terrain: "uneven_terrain",
   door: "sealed_door",
   corpse: "corpse_present",
@@ -95,6 +99,86 @@ function extractDurationHours(normalized) {
   }
 
   return null;
+}
+
+function requestsFullRecovery(normalized) {
+  return /\b(?:til|till|until)\b.*\b(?:health|hp)\b.*\bfull\b/.test(normalized)
+    || /\b(?:health|hp)\b.*\b(?:is|gets?|becomes?)\b.*\bfull\b/.test(normalized)
+    || /\b(?:reach|get|return to|recover to|restore to)\b.*\bfull\b.*\b(?:capacity|strength|health|hp)\b/.test(normalized)
+    || /\b(?:full|maximum|max)\b.*\b(?:capacity|stability|condition)\b/.test(normalized)
+    || /\b(?:capacity|stability|condition)\b.*\b(?:is|gets?|becomes?|reaches?)\b.*\bfull\b/.test(normalized)
+    || includesAny(normalized, [
+    "full health",
+    "full hp",
+    "full capacity",
+    "full condition",
+    "full stability",
+    "max health",
+    "max hp",
+    "max capacity",
+    "maximum capacity",
+    "fully heal",
+    "fully healed",
+    "fully recover",
+    "fully recovered",
+    "heal fully",
+    "recover fully",
+    "full strength",
+    "reach full capacity",
+    "reach full health",
+    "reach full hp",
+    "restore full capacity",
+    "restore full health",
+    "recover to full",
+    "back to full",
+    "top off",
+    "until healed",
+    "till healed",
+    "til healed",
+    "until i heal",
+    "till i heal",
+    "til i heal",
+    "until i get my health",
+    "till i get my health",
+    "til i get my health",
+    "until i get my full health",
+    "till i get my full health",
+    "til i get my full health",
+    "until full capacity",
+    "till full capacity",
+    "til full capacity",
+    "health is full",
+    "hp is full",
+    "health gets full",
+    "hp gets full",
+    "capacity is full",
+    "capacity gets full"
+  ]);
+}
+
+function requestsShortRest(normalized) {
+  return includesAny(normalized, [
+    "short nap",
+    "quick nap",
+    "brief nap",
+    "small nap",
+    "short rest",
+    "quick rest",
+    "brief rest",
+    "take a nap",
+    "power nap",
+    "catnap"
+  ]);
+}
+
+function getFullRecoveryDurationHours(player) {
+  const currentHp = Number(player?.hp || 0);
+  const maxHp = Number(player?.max_hp || currentHp || 1);
+  const missingHp = Math.max(0, maxHp - currentHp);
+
+  if (missingHp <= 0) return 1;
+
+  return clamp(Math.ceil(missingHp / 5) * 2, 2, 72);
 }
 
 function splitTextActionSteps(text = "") {
@@ -261,6 +345,7 @@ function interpretTextAction(text, { player, currentScene, enemy, boss, sceneTag
 function interpretUtilityStep(stepText, index, context) {
   const normalized = normalizeText(stepText);
   const durationHours = extractDurationHours(normalized);
+  const wantsFullRecovery = requestsFullRecovery(normalized);
   let intent = null;
   let actionKey = "typed";
   let requestedEffect = null;
@@ -271,10 +356,14 @@ function interpretUtilityStep(stepText, index, context) {
     actionKey = "move";
     requestedEffect = "reach_safety";
     objective = includesAny(normalized, ["safe place", "safety", "safe zone", "away from the fight"]) ? "safety" : "distance";
-  } else if (includesAny(normalized, ["rest", "sleep", "heal up", "recover", "catch my breath", "regain strength"])) {
+  } else if (includesAny(normalized, ["rest", "sleep", "nap", "heal up", "recover", "catch my breath", "regain strength"])) {
     intent = "rest";
     actionKey = "rest";
-    requestedEffect = "recover_hp";
+    requestedEffect = wantsFullRecovery ? "full_recovery" : requestsShortRest(normalized) ? "short_recovery" : "recover_hp";
+  } else if (includesAny(normalized, ["trap", "ambush", "snare", "set up", "prepare killzone", "kill zone"])) {
+    intent = "environment_control";
+    actionKey = "typed";
+    requestedEffect = "prepare_trap";
   } else if (includesAny(normalized, ["map", "chart", "draw a map", "map out", "survey the area", "survey"])) {
     intent = "map_area";
     actionKey = "look";
@@ -317,7 +406,17 @@ function interpretUtilityStep(stepText, index, context) {
     risk_level: intent === "escape" || intent === "move_toward_objective" ? "medium" : "low",
     requested_effect: requestedEffect,
     objective,
-    duration_hours: intent === "rest" ? (durationHours || 2) : durationHours,
+    duration_hours: intent === "rest"
+      ? durationHours || (wantsFullRecovery ? getFullRecoveryDurationHours(context.player) : requestsShortRest(normalized) ? 1 : 2)
+      : durationHours,
+    desired_full_recovery: intent === "rest" && wantsFullRecovery,
+    rest_intensity: intent === "rest"
+      ? wantsFullRecovery
+        ? "full"
+        : requestsShortRest(normalized)
+          ? "short"
+          : "normal"
+      : null,
     action_key: actionKey,
     tags_considered: context.sceneTags || [],
     confidence: 0.82,
@@ -442,6 +541,132 @@ function resolveEscapeOutcome({ player, opponent, interpretation, sceneTags }) {
   if (total >= difficulty) return { type: "partial_success", roll, total, difficulty };
   if (opponent && roll <= 4) return { type: "backfire", roll, total, difficulty };
   return { type: "fail", roll, total, difficulty };
+}
+
+function getEscapeDangerLevel({ player, opponent, sceneTags }) {
+  const hp = Number(player.hp || 0);
+  const maxHp = Number(player.max_hp || 1);
+  const hpRatio = maxHp > 0 ? hp / maxHp : 0;
+  let score = 0;
+
+  if (opponent) score += opponent.isBoss ? 4 : 2;
+  if (Number(opponent?.speed_stat || 0) >= Number(player.dexterity_stat || 0)) score += 2;
+  if (hpRatio <= 0.25) score += 2;
+  else if (hpRatio <= 0.5) score += 1;
+  if (sceneTags.includes("narrow_space")) score += 2;
+  if (sceneTags.includes("sealed_door")) score += 1;
+  if (sceneTags.includes("cover_available")) score -= 1;
+  if (sceneTags.includes("dark_area")) score -= 1;
+
+  if (score >= 6) return "severe";
+  if (score >= 4) return "high";
+  if (score >= 2) return "medium";
+  return "low";
+}
+
+function getEnemyAwareness(opponent, sceneTags) {
+  if (!opponent) return "none";
+  let score = opponent.isBoss ? 3 : 1;
+
+  if (Number(opponent.intelligence_stat || 0) >= 5) score += 1;
+  if (Number(opponent.speed_stat || 0) >= 5) score += 1;
+  if (sceneTags.includes("dark_area")) score -= 1;
+  if (sceneTags.includes("low_visibility")) score -= 1;
+
+  if (score >= 4) return "locked_on";
+  if (score >= 2) return "alert";
+  return "searching";
+}
+
+function getPositionPressure(sceneTags) {
+  if (sceneTags.includes("narrow_space")) return "tight";
+  if (sceneTags.includes("sealed_door")) return "sealed";
+  if (sceneTags.includes("cover_available")) return "covered";
+  if (sceneTags.includes("dark_area")) return "obscured";
+  if (sceneTags.includes("uneven_terrain")) return "unstable";
+  return "open";
+}
+
+function chooseEscapeWorldReaction({ player, opponent, interpretation, sceneTags, outcome }) {
+  const dangerLevel = getEscapeDangerLevel({ player, opponent, sceneTags });
+  const awareness = getEnemyAwareness(opponent, sceneTags);
+  const position = getPositionPressure(sceneTags);
+  const actor = opponent?.name || "the dungeon";
+  const isSafetyGoal = interpretation.objective === "safety" || interpretation.requested_effect === "reach_safety";
+  let type = "lost_pursuit";
+  let label = "Pursuit Broken";
+  let description = `${actor} loses the player's line of movement.`;
+  let movementResult = "escaped";
+  let nextSituation = isSafetyGoal ? "safer_ground" : "new_route";
+  let damageModifier = 0;
+  let pressureDelta = -2;
+
+  if (outcome.type === "success") {
+    if (position === "obscured" || sceneTags.includes("low_visibility")) {
+      type = "vanished_into_cover";
+      label = "Vanished Into Cover";
+      description = `The area hides the player's retreat before ${actor} can keep a clean line.`;
+    } else if (position === "sealed") {
+      type = "route_slipped";
+      label = "Seal Route Slipped";
+      description = `The player finds a narrow route through the seal pressure and breaks contact.`;
+    }
+  } else if (outcome.type === "partial_success") {
+    movementResult = "moved_under_pressure";
+    nextSituation = "temporary_cover";
+    pressureDelta = 1;
+
+    if (awareness === "locked_on" || opponent?.isBoss) {
+      type = "chased";
+      label = "Chased Through the Dungeon";
+      description = `${actor} keeps pressure on the retreat and forces the player to move under pursuit.`;
+      damageModifier = 1;
+    } else if (position === "tight" || position === "sealed") {
+      type = "rerouted";
+      label = "Rerouted Under Pressure";
+      description = `The direct route closes, forcing the player into a worse but survivable side path.`;
+    } else {
+      type = "temporary_cover";
+      label = "Temporary Cover";
+      description = `The player reaches cover, but the danger has not fully lost them.`;
+    }
+  } else if (outcome.type === "backfire") {
+    type = "cornered";
+    label = "Cornered";
+    description = `${actor} reads the escape attempt and drives the player into a bad position.`;
+    movementResult = "cornered";
+    nextSituation = "cornered";
+    damageModifier = 2;
+    pressureDelta = 3;
+  } else {
+    movementResult = "blocked";
+    nextSituation = "still_in_danger";
+    pressureDelta = 2;
+
+    if (position === "tight" || position === "sealed" || opponent?.isBoss) {
+      type = "blocked_path";
+      label = "Path Blocked";
+      description = `${actor} cuts off the route before the player can turn it into distance.`;
+      damageModifier = 1;
+    } else {
+      type = "intercepted";
+      label = "Intercepted";
+      description = `${actor} closes the gap and interrupts the retreat.`;
+    }
+  }
+
+  return {
+    type,
+    label,
+    description,
+    danger_level: dangerLevel,
+    enemy_awareness: awareness,
+    position_pressure: position,
+    movement_result: movementResult,
+    next_situation: nextSituation,
+    pressure_delta: pressureDelta,
+    damage_modifier: damageModifier
+  };
 }
 
 function rollOutcome({ player, opponent, interpretation, sceneTags }) {
@@ -620,7 +845,53 @@ async function resolveTextAction(conn, { player, input, interpretation, enemy, b
 
   if (interpretation.intent === "rest") {
     const cost = getCostProfile(interpretation);
-    const healAmount = Math.max(3, Math.ceil(cost.timeCostHours / 2) * 5);
+    if (opponent) {
+      const enemyDamage = calculateEnemyDamage(opponent, player, 0);
+      const playerHpAfter = Math.max(0, Number(player.hp || 0) - enemyDamage);
+
+      return {
+        input,
+        normalized: "typed",
+        resolved_intent: interpretation.intent,
+        resolution_type: "interrupted",
+        effect_applied: {
+          type: "rest",
+          area: player.current_area,
+          heal_amount: 0,
+          hp_after: playerHpAfter,
+          duration_hours: 1,
+          interrupted: true,
+          world_reaction: {
+            type: "rest_interrupted",
+            label: "Rest Interrupted",
+            description: `${opponent.name} does not allow recovery while the player remains within reach.`,
+            danger_level: getEscapeDangerLevel({ player, opponent, sceneTags }),
+            enemy_awareness: getEnemyAwareness(opponent, sceneTags),
+            movement_result: "held_in_danger",
+            next_situation: "under_pressure",
+            pressure_delta: 2
+          },
+          enemy_pressure: {
+            name: opponent.name,
+            type: opponent.isBoss ? "boss" : "enemy",
+            speed: opponent.speed_stat,
+            level: opponent.level
+          },
+          damage_taken: enemyDamage
+        },
+        battleResult: null,
+        playerHpAfter,
+        enemyHpAfter: opponent.currentHp,
+        cost: { timeCostHours: 1, hpRiskCost: 1 },
+        narrationOutcome: `The player tries to rest in ${player.current_area}, but ${opponent.name} interrupts the recovery.`
+      };
+    }
+
+    const healAmount = interpretation.desired_full_recovery
+      ? Math.max(0, Number(player.max_hp || 0) - Number(player.hp || 0))
+      : interpretation.rest_intensity === "short"
+        ? 3
+        : Math.max(3, Math.ceil(cost.timeCostHours / 2) * 5);
     const hpAfter = Math.min(Number(player.max_hp || 0), Number(player.hp || 0) + healAmount);
 
     return {
@@ -633,23 +904,33 @@ async function resolveTextAction(conn, { player, input, interpretation, enemy, b
         area: player.current_area,
         heal_amount: hpAfter - Number(player.hp || 0),
         hp_after: hpAfter,
-        duration_hours: cost.timeCostHours
+        duration_hours: cost.timeCostHours,
+        desired_full_recovery: !!interpretation.desired_full_recovery,
+        rest_intensity: interpretation.rest_intensity || "normal",
+        recovery_complete: hpAfter >= Number(player.max_hp || 0)
       },
       battleResult: null,
       playerHpAfter: hpAfter,
       enemyHpAfter: null,
       cost,
-      narrationOutcome: `The player rests for ${cost.timeCostHours} hour${cost.timeCostHours === 1 ? "" : "s"} and recovers.`
+      narrationOutcome: interpretation.desired_full_recovery
+        ? `The player rests until recovery reaches ${hpAfter}/${player.max_hp} HP.`
+        : interpretation.rest_intensity === "short"
+          ? `The player takes a short nap for ${cost.timeCostHours} hour${cost.timeCostHours === 1 ? "" : "s"} and recovers lightly.`
+        : `The player rests for ${cost.timeCostHours} hour${cost.timeCostHours === 1 ? "" : "s"} and recovers.`
     };
   }
 
   if (interpretation.intent === "escape") {
     const cost = getCostProfile(interpretation);
     const outcome = resolveEscapeOutcome({ player, opponent, interpretation, sceneTags });
+    const worldReaction = chooseEscapeWorldReaction({ player, opponent, interpretation, sceneTags, outcome });
     const escaped = outcome.type === "success";
     const reachedTemporarySafety = outcome.type === "partial_success";
     const enemyDamage = opponent && ["partial_success", "fail", "backfire"].includes(outcome.type)
-      ? calculateEnemyDamage(opponent, player, outcome.type === "partial_success" ? 2 : 0) + (outcome.type === "backfire" ? 1 : 0)
+      ? calculateEnemyDamage(opponent, player, outcome.type === "partial_success" ? 2 : 0)
+        + (outcome.type === "backfire" ? 1 : 0)
+        + worldReaction.damage_modifier
       : 0;
     const playerHpAfter = Math.max(0, Number(player.hp || 0) - enemyDamage);
     const safetyState = escaped
@@ -671,6 +952,7 @@ async function resolveTextAction(conn, { player, input, interpretation, enemy, b
         safety_state: safetyState,
         escaped,
         reached_temporary_safety: reachedTemporarySafety,
+        world_reaction: worldReaction,
         enemy_pressure: opponent
           ? {
               name: opponent.name,
@@ -681,7 +963,7 @@ async function resolveTextAction(conn, { player, input, interpretation, enemy, b
           : null,
         chase_damage: enemyDamage,
         hp_after: playerHpAfter,
-        moved: escaped || reachedTemporarySafety,
+        moved: ["escaped", "moved_under_pressure"].includes(worldReaction.movement_result),
         tags_used: sceneTags,
         roll: outcome.roll,
         total: outcome.total,
@@ -692,17 +974,59 @@ async function resolveTextAction(conn, { player, input, interpretation, enemy, b
       enemyHpAfter: opponent?.currentHp ?? null,
       cost,
       narrationOutcome: escaped
-        ? "The player breaks away from the fight and reaches safer ground."
+        ? `The player tries to escape. ${worldReaction.description}`
         : reachedTemporarySafety
-          ? "The player gains distance and reaches temporary cover, but pursuit has not fully ended."
+          ? `The player tries to escape. ${worldReaction.description}`
           : enemyDamage > 0
-            ? "The player tries to escape, but pressure follows and the retreat costs blood."
-            : "The player tries to escape, but cannot create enough distance."
+            ? `The player tries to escape. ${worldReaction.description} The retreat costs blood.`
+            : `The player tries to escape. ${worldReaction.description}`
     };
   }
 
   if (["map_area", "scout_area", "plan_next_move", "move_toward_objective"].includes(interpretation.intent)) {
     const cost = getCostProfile(interpretation);
+    if (opponent && interpretation.intent === "move_toward_objective") {
+      const enemyDamage = calculateEnemyDamage(opponent, player, 1);
+      const playerHpAfter = Math.max(0, Number(player.hp || 0) - enemyDamage);
+
+      return {
+        input,
+        normalized: "typed",
+        resolved_intent: interpretation.intent,
+        resolution_type: "blocked",
+        effect_applied: {
+          type: interpretation.intent,
+          area: player.current_area,
+          requested_effect: interpretation.requested_effect,
+          objective: interpretation.objective || null,
+          moved: false,
+          hp_after: playerHpAfter,
+          damage_taken: enemyDamage,
+          world_reaction: {
+            type: "advance_blocked",
+            label: "Advance Blocked",
+            description: `${opponent.name} controls the route and prevents clean movement toward the objective.`,
+            danger_level: getEscapeDangerLevel({ player, opponent, sceneTags }),
+            enemy_awareness: getEnemyAwareness(opponent, sceneTags),
+            movement_result: "blocked",
+            next_situation: "must_deal_with_threat",
+            pressure_delta: 2
+          },
+          enemy_pressure: {
+            name: opponent.name,
+            type: opponent.isBoss ? "boss" : "enemy",
+            speed: opponent.speed_stat,
+            level: opponent.level
+          },
+          tags_used: sceneTags
+        },
+        battleResult: null,
+        playerHpAfter,
+        enemyHpAfter: opponent.currentHp,
+        cost,
+        narrationOutcome: `The player tries to push toward the objective, but ${opponent.name} blocks the route.`
+      };
+    }
 
     return {
       input,

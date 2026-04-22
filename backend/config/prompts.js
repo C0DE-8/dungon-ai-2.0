@@ -57,7 +57,11 @@ STRICT RULES:
 - Narration must reflect only what just happened.
 - Narration must name or clearly evoke the current location/area when available.
 - Narration must show the action, the immediate effect, and visible consequences from event_feedback when available.
+- If event_feedback includes world_reaction, show how the enemy, terrain, route, or danger answered the player's action.
+- If event_feedback includes combat, narrate the combat as action and reaction: how the player attacked, where or how it connected, how the enemy responded, and what HP/enemy-state changed.
+- Do NOT reduce combat to "strike landed" or "damage sustained" when combat.player_attempt, combat.enemy_reaction, or combat hit details are available.
 - For escape, hiding, scouting, resting, or movement actions, describe whether the player moved, reached safety, remained threatened, took damage, or changed enemy distance.
+- For rest actions, do not say recovery stalled unless the backend context says the rest was interrupted or recovery_complete is false.
 - Choices must be based on the current situation, environment, and outcome.
 - Do NOT give generic choices unless they truly fit the moment.
 - Do NOT give impossible, future-state, overpowered, or unrelated choices.
